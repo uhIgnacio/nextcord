@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
+from os import getenv, urandom
+import math
 
 import aiohttp
 
@@ -40,7 +43,7 @@ from .errors import (
     ConnectionClosed,
     PrivilegedIntentsRequired,
 )
-
+from .ext.ipc import IpcClient
 from .enums import Status
 
 from typing import TYPE_CHECKING, Any, Callable, Tuple, Type, Optional, List, Dict, TypeVar
@@ -54,6 +57,7 @@ if TYPE_CHECKING:
 
 __all__ = (
     'AutoShardedClient',
+    'AutoClusteredClient',
     'ShardInfo',
 )
 
@@ -544,3 +548,141 @@ class AutoShardedClient(Client):
         .. versionadded:: 1.6
         """
         return any(shard.ws.is_ratelimited() for shard in self.__shards.values())
+
+class AutoClusteredClient(Client):
+    """A client similar to :class:`AutoShardedClient` except it handles the complications
+    of splitting the bot into smaller processes and communicating between them for the user.
+
+    It is recommended to use this client only if you have surpassed at least
+    1000 guilds and are having issues with GIL or similar.
+
+    If no :attr:`.shard_count` is provided, then the library will use the
+    Bot Gateway endpoint call to figure out how many shards to use.
+
+    If a ``shard_ids`` parameter is given, then those shard IDs will be used
+    to launch the internal shards. Note that :attr:`.shard_count` must be provided
+    if this is used. By default, when omitted, the client will launch shards from
+    0 to ``shard_count - 1``.
+
+    Attributes
+    ------------
+    shard_count: Optional[:class:`int`]
+        An optional list of shard_ids to launch the shards with.
+    process_count: Optional[:class:`int`]
+        How many processes to split the shards on.
+    """
+
+
+    def __init__(self, *args: Any, loop: Optional[asyncio.AbstractEventLoop] = None, **kwargs: Any) -> None:
+        self.shard_count = kwargs.pop("shard_count", None)
+        self.process_count = kwargs.pop("process_count", None)
+
+        super().__init__(*args, loop=loop, **kwargs)
+        
+        ipc_secret = getenv("NEXTCORD_AUTOSHARD_IPC_KEY", urandom(15).hex())
+        self.ipc = IpcClient(ipc_secret)
+        self.loop.create_task(self.ipc.connect())
+
+        # instead of a single websocket, we have multiple
+        # the key is the shard_id
+        self.__shards = {}
+        self._connection._get_websocket = self._get_websocket
+        self._connection._get_client = lambda: self
+        self.__queue = asyncio.PriorityQueue()
+        self._close_event = asyncio.Event()
+
+    def _get_websocket(self, guild_id: Optional[int] = None, *, shard_id: Optional[int] = None) -> DiscordWebSocket:
+        if shard_id is None:
+            # guild_id won't be None if shard_id is None and shard_count won't be None here
+            shard_id = (guild_id >> 22) % self.shard_count  # type: ignore
+        try:
+            return self.__shards[shard_id].ws
+        except KeyError:
+            raise NotImplementedError("Getting a remote shard is not implemented yet")
+
+    async def launch_shard(self, gateway: str, shard_id: int, *, initial: bool = False) -> None:
+        raise NotImplementedError()
+        try:
+            coro = DiscordWebSocket.from_client(self, initial=initial, gateway=gateway, shard_id=shard_id)
+            ws = await asyncio.wait_for(coro, timeout=180.0)
+        except Exception:
+            _log.exception('Failed to connect for shard_id: %s. Retrying...', shard_id)
+            await asyncio.sleep(5.0)
+            return await self.launch_shard(gateway, shard_id)
+
+        # keep reading the shard while others connect
+        self.__shards[shard_id] = ret = Shard(ws, self, self.__queue.put_nowait)
+        ret.launch()
+
+    async def launch_shards(self) -> None:
+        return
+        raise NotImplementedError()
+        if self.shard_count is None:
+            self.shard_count, gateway = await self.http.get_bot_gateway()
+        else:
+            gateway = await self.http.get_gateway()
+
+        self._connection.shard_count = self.shard_count
+
+        shard_ids = self.shard_ids or range(self.shard_count)
+        self._connection.shard_ids = shard_ids
+
+        for shard_id in shard_ids:
+            initial = shard_id == shard_ids[0]
+            await self.launch_shard(gateway, shard_id, initial=initial)
+
+        self._connection.shards_launched.set()
+
+    async def connect(self, *, reconnect: bool = True) -> None:
+        self._reconnect = reconnect
+        await self.launch_shards()
+        await self.ipc.connected_event.wait()
+        print(f"Authority: {self.ipc._authority}")
+        
+        if self.ipc._authority == "worker":
+            while not self.is_closed():
+                item = await self.__queue.get()
+                if item.type == EventType.close:
+                    await self.close()
+                    if isinstance(item.error, ConnectionClosed):
+                        if item.error.code != 1000:
+                            raise item.error
+                        if item.error.code == 4014:
+                            raise PrivilegedIntentsRequired(item.shard.id) from None
+                    return
+                elif item.type in (EventType.identify, EventType.resume):
+                    await item.shard.reidentify(item.error)
+                elif item.type == EventType.reconnect:
+                    await item.shard.reconnect()
+                elif item.type == EventType.terminate:
+                    await self.close()
+                    raise item.error
+                elif item.type == EventType.clean_close:
+                    return
+        else:
+            await self._launch_processes()
+            await self._close_event.wait()
+
+    async def _launch_processes(self):
+        if self.shard_count is None:
+            self.shard_count, gateway = await self.http.get_bot_gateway()
+        else:
+            gateway = await self.http.get_gateway()
+        process_count = math.ceil(self.shard_count / 5)
+        print(f"Connecting with {process_count} processes")
+        for process_id in range(process_count):
+            env_vars = {
+                "NEXTCORD_AUTOSHARD_IPC_KEY": self.ipc._secret_key,
+            }
+            print(f"Creating process {process_id}")
+            self.loop.create_task(asyncio.create_subprocess_exec(sys.executable, *sys.argv, env=env_vars))
+
+    @property
+    async def authority(self):
+        # TODO: Typing breaks here?
+        await self.ipc.connected_event.wait()
+        return self.ipc._authority
+
+
+
+

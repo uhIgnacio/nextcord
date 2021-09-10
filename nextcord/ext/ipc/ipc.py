@@ -3,6 +3,8 @@ from tempfile import gettempdir
 from pathlib import Path
 from aiohttp import ClientSession, web, UnixConnector, client_exceptions
 from uuid import uuid4
+from asyncio import Event
+
 try:
     from orjson import loads
 except:
@@ -27,6 +29,7 @@ class IpcClient():
         self._host = host
         self._ws = None # TODO: Typehint
         self._app = None
+        self.connected_event = Event()
         
         if url is not None and host is not None:
             raise TypeError("You can only specify one of url and host.")
@@ -57,8 +60,13 @@ class IpcClient():
                 except OSError:
                     # Port must have been taken by some other service.
                     continue
+                self._authority = "master"
+                self.connected_event.set()
+                return
         else:
             # Successfully connected
+            self._authority = "worker"
+            self.connected_event.set()
             ...
                 
 
