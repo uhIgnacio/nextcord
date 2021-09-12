@@ -582,6 +582,10 @@ class AutoClusteredClient(Client):
         ipc_secret = getenv("NEXTCORD_AUTOSHARD_IPC_KEY", urandom(15).hex())
         self.ipc = IpcClient(ipc_secret)
         self.loop.create_task(self.ipc.connect())
+        self._worker_id = getenv("NEXTCORD_AUTOSHARD_IPC_ID", None)
+        if self._worker_id is not None:
+            self._worker_id = int(self._worker_id)
+        
 
         # instead of a single websocket, we have multiple
         # the key is the shard_id
@@ -590,6 +594,9 @@ class AutoClusteredClient(Client):
         self._connection._get_client = lambda: self
         self.__queue = asyncio.PriorityQueue()
         self._close_event = asyncio.Event()
+
+        # Register IPC events
+        self.ipc.register_listener(self.on_ipc_data_request, "nextcord_mps_fetch")
 
     def _get_websocket(self, guild_id: Optional[int] = None, *, shard_id: Optional[int] = None) -> DiscordWebSocket:
         if shard_id is None:
@@ -615,17 +622,15 @@ class AutoClusteredClient(Client):
         ret.launch()
 
     async def launch_shards(self) -> None:
-        return
-        raise NotImplementedError()
-        if self.shard_count is None:
-            self.shard_count, gateway = await self.http.get_bot_gateway()
-        else:
-            gateway = await self.http.get_gateway()
+        shard_ids_payload = await self.ipc.request("nextcord_mps_fetch", {"resource": "shard_ids", "worker_id": self._worker_id})
+        shard_ids = shard_ids_payload["ids"]
+        await self.ipc.add_labels(*[f"shard_{shard_id}" for shard_id in shard_ids])
 
         self._connection.shard_count = self.shard_count
 
-        shard_ids = self.shard_ids or range(self.shard_count)
         self._connection.shard_ids = shard_ids
+
+        gateway = await self._connection.http.get_gateway()
 
         for shard_id in shard_ids:
             initial = shard_id == shard_ids[0]
@@ -635,11 +640,11 @@ class AutoClusteredClient(Client):
 
     async def connect(self, *, reconnect: bool = True) -> None:
         self._reconnect = reconnect
-        await self.launch_shards()
         await self.ipc.connected_event.wait()
-        print(f"Authority: {self.ipc._authority}")
         
         if self.ipc._authority == "worker":
+            await self.ipc.add_labels("worker", f"worker_{self._worker_id}")
+            await self.launch_shards()
             while not self.is_closed():
                 item = await self.__queue.get()
                 if item.type == EventType.close:
@@ -669,20 +674,37 @@ class AutoClusteredClient(Client):
         else:
             gateway = await self.http.get_gateway()
         process_count = math.ceil(self.shard_count / 5)
-        print(f"Connecting with {process_count} processes")
         for process_id in range(process_count):
             env_vars = {
                 "NEXTCORD_AUTOSHARD_IPC_KEY": self.ipc._secret_key,
+                "NEXTCORD_AUTOSHARD_IPC_ID": str(process_id)
             }
-            print(f"Creating process {process_id}")
             self.loop.create_task(asyncio.create_subprocess_exec(sys.executable, *sys.argv, env=env_vars))
+
+    def _get_state(self, **options: Any) -> AutoShardedConnectionState:
+        return AutoClusteredConnectionState(
+            dispatch=self.dispatch,
+            handlers=self._handlers,
+            hooks=self._hooks,
+            http=self.http,
+            loop=self.loop,
+            **options,
+        )
+
 
     @property
     async def authority(self):
         # TODO: Typing breaks here?
         await self.ipc.connected_event.wait()
         return self.ipc._authority
+    
+    async def on_ipc_data_request(self, message):
+        requested_data = message["resource"]
 
-
+        if requested_data == "shard_ids":
+            worker_id = message["worker_id"]
+            shards_per_process = int(self.shard_count / (self.process_count or self.shard_count / 5))
+            offset = shards_per_process * worker_id
+            await message.respond({"ids": list(range(offset, offset + shards_per_process)), "offset": offset})
 
 

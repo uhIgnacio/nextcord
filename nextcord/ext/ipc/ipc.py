@@ -1,9 +1,7 @@
 from typing import overload
-from tempfile import gettempdir
-from pathlib import Path
-from aiohttp import ClientSession, web, UnixConnector, client_exceptions
+from aiohttp import ClientSession, web, client_exceptions
+from asyncio import Event, Future, get_event_loop
 from uuid import uuid4
-from asyncio import Event
 
 try:
     from orjson import loads
@@ -28,8 +26,15 @@ class IpcClient():
         self._url = url
         self._host = host
         self._ws = None # TODO: Typehint
+        self.connections = []
         self._app = None
+        self._dispatchers = {}
+        self._temporary_request_listeners = {}
+        self.event_listeners = {}
         self.connected_event = Event()
+        self._session = ClientSession()
+        self._labels = []
+        self.loop = get_event_loop()
         
         if url is not None and host is not None:
             raise TypeError("You can only specify one of url and host.")
@@ -39,7 +44,8 @@ class IpcClient():
             self._authority = "master"
         else:
             self._authority = "dynamic"
-            # TODO: Discover authority
+
+        self.register_listener(self.on_ipc_setlabels, "ipc_setlabels")
 
     async def connect(self):
         discovery_result = await self._discover()
@@ -67,35 +73,31 @@ class IpcClient():
             # Successfully connected
             self._authority = "worker"
             self.connected_event.set()
-            ...
                 
 
     async def _discover(self):
         taken_ports = []
-        async with ClientSession() as session:
-            for port in range(IpcClient.autoconnect_port_range[0], IpcClient.autoconnect_port_range[1]):
-                try:
-                    connection = await session.ws_connect(f"ws://localhost:{port}/nextcord-ipc")
-                except client_exceptions.ClientConnectorError:
-                    continue
-                except client_exceptions.WSServerHandshakeError:
-                    # Server exists but it wasnt a websocket server there.
-                    taken_ports.append(port)
-                    continue
-                print(f"Can reach on port {port}")
-                await connection.send_json({"type": "auth", "data": self._secret_key})
-                self._ws = connection
-                return
+        for port in range(IpcClient.autoconnect_port_range[0], IpcClient.autoconnect_port_range[1]):
+            try:
+                connection = await self._session.ws_connect(f"ws://localhost:{port}/nextcord-ipc")
+            except client_exceptions.ClientConnectorError:
+                continue
+            except client_exceptions.WSServerHandshakeError:
+                # Server exists but it wasnt a websocket server there.
+                taken_ports.append(port)
+                continue
+            await connection.send_json({"type": "auth", "data": self._secret_key})
+            self._ws = connection
+            self.loop.create_task(self.client_receive_loop())
+            return
         return taken_ports
 
 
     async def _on_request(self, request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        print("IPC user connecting!")
 
         login_packet = loads((await ws.receive()).data)
-        print(login_packet)
         if login_packet["type"] != "auth":
             await ws.send_json({"type": "auth", "ok": False, "message": "Sent non-auth packet before authenticating"})
             return
@@ -104,11 +106,145 @@ class IpcClient():
             return
         else:
             await ws.send_json({"type": "auth", "ok": True})
-        print("IPC user connected!")
+        connection = Connection(ws, login_packet.get("labels", []))
+        self.connections.append(connection)
         async for message in ws:
-            print(message)
-            
+            data = loads(message.data)
+            print(data)
+            parsed_message = IpcMessage(data, self, connection=connection)
+            self.dispatch(parsed_message)
 
+    async def send_raw_message(self, event, message, target=None, *, response_id=None, request_id=None):
+        payload = {
+            "type": event,
+            "data": message,
+            "target": target,
+            "response_id": response_id,
+            "request_id": request_id,
+            "from": self.labels[0] if len(self.labels) > 0 else None
+        }
+        print(f"Sending {payload}")
+        if self._authority == "master":
+            if target is None:
+                # Its a broadcast
+                for connection in self.connections:
+                    await connection.send_raw(payload)
+                self.dispatch(IpcMessage(payload, self))
+            elif target == "master":
+                self.dispatch(IpcMessage(payload, self))
+            else:
+                # Directed at spesific targets
+                connections = self.get_connections_by_label(target)
+                if len(connections) == 0:
+                    raise ValueError(f"No connections are connected with the label \"{target}\"")
+                for connection in connections:
+                    await connection.send_raw(payload)
+        else:
+            await self._ws.send_json(payload)
+    async def request(self, event, message, target=None):
+        request_id = uuid4().hex
+        future = self.register_response(request_id)
+        await self.send_raw_message(event, message, target, request_id=request_id)
+        return await future
+
+    async def send_message(self, event, message, target=None):
+        await self.send_raw_message(event, message, target)
+
+    def get_connections_by_label(self, label):
+        connections = []
+        for connection in self.connections:
+            if label in connection.labels:
+                connections.append(connection)
+        return connections
+
+    def register_response(self, response_id):
+        listeners = self._temporary_request_listeners
+        future = Future()
+        listeners[response_id] = future
+        return future
+
+    def dispatch(self, message):
+        response_id = message._raw_data.get("response_id")
+        if response_id is not None:
+            future = self._temporary_request_listeners.get(response_id, None)
+            if future is None:
+                print("Response was received for non-request message")
+            else:
+                future.set_result(message)
+        self._dispatch_list(self.event_listeners.get("receive"), [])
+        self._dispatch_list(message, self.event_listeners.get(message._raw_data["type"], []))
+        
+    def _dispatch_list(self, message, targets):
+        for target in targets:
+            self.loop.create_task(target(message))
+
+    def register_listener(self, listener, event=None):
+        if event is None:
+            func_name = listener.__name__
+            if not func_name.startswith("on_"):
+                raise ValueError("Event listener function names have to start with on_")
+            event = func_name[2:]
+        if event not in self.event_listeners.keys():
+            self.event_listeners[event] = []
+        self.event_listeners[event].append(listener)
+
+    @property
+    def labels(self):
+        return self._labels
+    
+    async def set_labels(self, labels: list[str]):
+        await self.send_message("ipc_setlabels", labels, "master")
+        self._labels = labels
+
+    async def add_labels(self, *labels: str):
+        await self.set_labels([*labels, *self.labels])
+
+    async def on_ipc_setlabels(self, message):
+        message._connection.labels = message.payload
+
+    async def client_receive_loop(self):
+        async for message in self._ws:
+            data = loads(message.data)
+            self.dispatch(IpcMessage(data, self))
 
         
 
+
+
+class IpcMessage():
+    def __init__(self, data, ipc_client, *, connection=None):
+        self.payload = data.get("data")
+        
+        # Internal data
+        self._raw_data = data
+        self._ipc = ipc_client
+        self._has_responded = False
+        self._connection = connection
+
+    async def respond(self, message, *, request_response=False):
+        if (response_id := self._raw_data.get("request_id")) is None:
+            raise ValueError("Can't respond to a non-respondable message")
+        if request_response:
+            request_id = uuid4().hex
+            response = self._ipc.register_response(request_id)
+        else:
+            request_id = None
+        await self._ipc.send_raw_message(None, message, self._raw_data["from"], response_id=response_id, request_id=request_id)
+        if request_response:
+            return await response
+
+    @property
+    def respondable(self):
+        return bool(self._raw_data.get("request_id")) and not self._has_responded
+
+    def __getitem__(self, key: str):
+        return self.payload[key]
+
+        
+class Connection:
+    def __init__(self, websocket, labels):
+        self._ws = websocket
+        self.labels = labels
+
+    async def send_raw(self, data):
+        await self._ws.send_json(data)
