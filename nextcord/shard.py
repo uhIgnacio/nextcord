@@ -608,7 +608,6 @@ class AutoClusteredClient(Client):
             raise NotImplementedError("Getting a remote shard is not implemented yet")
 
     async def launch_shard(self, gateway: str, shard_id: int, *, initial: bool = False) -> None:
-        raise NotImplementedError()
         try:
             coro = DiscordWebSocket.from_client(self, initial=initial, gateway=gateway, shard_id=shard_id)
             ws = await asyncio.wait_for(coro, timeout=180.0)
@@ -671,10 +670,8 @@ class AutoClusteredClient(Client):
     async def _launch_processes(self):
         if self.shard_count is None:
             self.shard_count, gateway = await self.http.get_bot_gateway()
-        else:
-            gateway = await self.http.get_gateway()
         process_count = math.ceil(self.shard_count / 5)
-        for process_id in range(process_count):
+        for process_id in range(process_count + 1):
             env_vars = {
                 "NEXTCORD_AUTOSHARD_IPC_KEY": self.ipc._secret_key,
                 "NEXTCORD_AUTOSHARD_IPC_ID": str(process_id)
@@ -703,8 +700,9 @@ class AutoClusteredClient(Client):
 
         if requested_data == "shard_ids":
             worker_id = message["worker_id"]
-            shards_per_process = int(self.shard_count / (self.process_count or self.shard_count / 5))
+            shards_per_process = math.ceil(self.shard_count / (self.process_count or (self.shard_count / 5)))
             offset = shards_per_process * worker_id
-            await message.respond({"ids": list(range(offset, offset + shards_per_process)), "offset": offset})
+            print(self.shard_count)
+            await message.respond({"ids": list(range(offset, min(offset + shards_per_process, self.shard_count))), "offset": offset})
 
 

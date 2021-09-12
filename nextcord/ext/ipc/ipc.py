@@ -178,24 +178,26 @@ class IpcClient():
     def dispatch(self, message):
         response_id = message._raw_data.get("response_id")
         if response_id is not None:
-            future = self._temporary_request_listeners.get(response_id, None)
-            if future is None:
+            listener = self._temporary_request_listeners.get(response_id, None)
+            if listener is None:
                 print("Response was received for non-request message")
+                print(response_id)
+                print(self._temporary_request_listeners)
+            elif isinstance(listener, Future):
+                listener.set_result(message)
+                del self._temporary_request_listeners[response_id]
             else:
-                future.set_result(message)
+                listener[2].append(message)
+                listener[1] -= 1
+                if listener[1] <= 0:
+                    listener[1].set_result(listener[2])
+                    del self._temporary_request_listeners[response_id]
         self._dispatch_list(self.event_listeners.get("receive"), [])
         self._dispatch_list(message, self.event_listeners.get(message._raw_data["type"], []))
         
     def _dispatch_list(self, message, targets):
         for target in targets:
-            if isinstance(target, list):
-                # Has more than one use
-                target[2].append(message)
-                target[1] -= 1 # Reduce the amount of uses
-                if len(target) <= 0:
-                    target[0].set_result(target[2])
-            else:
-                self.loop.create_task(target(message))
+            self.loop.create_task(target(message))
 
     def register_listener(self, listener, event=None):
         if event is None:
@@ -216,7 +218,7 @@ class IpcClient():
         self._labels = labels
 
     async def add_labels(self, *labels: str):
-        await self.set_labels([*labels, *self.labels])
+        await self.set_labels([*self.labels, *labels])
 
     async def on_ipc_setlabels(self, message):
         message._connection.labels = message.payload

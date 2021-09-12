@@ -59,6 +59,7 @@ __all__ = (
     'when_mentioned_or',
     'Bot',
     'AutoShardedBot',
+    'AutoClusteredBot',
 )
 
 MISSING: Any = nextcord.utils.MISSING
@@ -1109,5 +1110,11 @@ class Bot(BotBase, nextcord.Client):
 class AutoShardedBot(BotBase, nextcord.AutoShardedClient):
     """This is similar to :class:`.Bot` except that it is inherited from
     :class:`nextcord.AutoShardedClient` instead.
+    """
+    pass
+
+class AutoClusteredBot(BotBase, nextcord.AutoClusteredClient):
+    """This is similar to :class:`.Bot` except that it is inherited from
+    :class:`nextcord.AutoClusteredClient` instead.
     """
     pass
