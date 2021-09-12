@@ -32,7 +32,7 @@ import math
 
 import aiohttp
 
-from .state import AutoShardedConnectionState
+from .state import AutoShardedConnectionState, AutoClusteredConnectionState
 from .client import Client
 from .backoff import ExponentialBackoff
 from .gateway import *

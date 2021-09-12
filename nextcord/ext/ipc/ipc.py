@@ -146,6 +146,16 @@ class IpcClient():
         future = self.register_response(request_id)
         await self.send_raw_message(event, message, target, request_id=request_id)
         return await future
+    async def request_many(self, event, message, target=None):
+        connections_with_label = await self.request("ipc_query_label", {"label": target}, "master")
+        label_count = connections_with_label["count"]
+
+        if label_count == 0:
+            raise ValueError("There is no receivers for this label")
+
+        request_id = uuid4().hex
+        future = self.register_response(request_id, label_count)
+        return await future
 
     async def send_message(self, event, message, target=None):
         await self.send_raw_message(event, message, target)
@@ -157,12 +167,14 @@ class IpcClient():
                 connections.append(connection)
         return connections
 
-    def register_response(self, response_id):
+    def register_response(self, response_id, response_count=None):
         listeners = self._temporary_request_listeners
         future = Future()
-        listeners[response_id] = future
+        if response_count is None:
+            listeners[response_id] = future
+        else:
+            listeners[response_id] = [future, response_count, []]
         return future
-
     def dispatch(self, message):
         response_id = message._raw_data.get("response_id")
         if response_id is not None:
@@ -176,7 +188,14 @@ class IpcClient():
         
     def _dispatch_list(self, message, targets):
         for target in targets:
-            self.loop.create_task(target(message))
+            if isinstance(target, list):
+                # Has more than one use
+                target[2].append(message)
+                target[1] -= 1 # Reduce the amount of uses
+                if len(target) <= 0:
+                    target[0].set_result(target[2])
+            else:
+                self.loop.create_task(target(message))
 
     def register_listener(self, listener, event=None):
         if event is None:

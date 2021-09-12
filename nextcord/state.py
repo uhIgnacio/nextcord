@@ -1528,3 +1528,6 @@ class AutoShardedConnectionState(ConnectionState):
     def parse_resumed(self, data) -> None:
         self.dispatch('resumed')
         self.dispatch('shard_resumed', data['__shard_id__'])
+
+class AutoClusteredConnectionState(AutoShardedConnectionState):
+    ...
