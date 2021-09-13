@@ -702,7 +702,6 @@ class AutoClusteredClient(Client):
             worker_id = message["worker_id"]
             shards_per_process = math.ceil(self.shard_count / (self.process_count or (self.shard_count / 5)))
             offset = shards_per_process * worker_id
-            print(self.shard_count)
             await message.respond({"ids": list(range(offset, min(offset + shards_per_process, self.shard_count))), "offset": offset})
 
 

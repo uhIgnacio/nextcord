@@ -110,7 +110,6 @@ class IpcClient():
         self.connections.append(connection)
         async for message in ws:
             data = loads(message.data)
-            print(data)
             parsed_message = IpcMessage(data, self, connection=connection)
             self.dispatch(parsed_message)
 
@@ -123,7 +122,6 @@ class IpcClient():
             "request_id": request_id,
             "from": self.labels[0] if len(self.labels) > 0 else None
         }
-        print(f"Sending {payload}")
         if self._authority == "master":
             if target is None:
                 # Its a broadcast
@@ -168,21 +166,19 @@ class IpcClient():
         return connections
 
     def register_response(self, response_id, response_count=None):
-        listeners = self._temporary_request_listeners
         future = Future()
         if response_count is None:
-            listeners[response_id] = future
+            self._temporary_request_listeners[response_id] = future
         else:
-            listeners[response_id] = [future, response_count, []]
+            self._temporary_request_listeners[response_id] = [future, response_count, []]
         return future
     def dispatch(self, message):
         response_id = message._raw_data.get("response_id")
         if response_id is not None:
             listener = self._temporary_request_listeners.get(response_id, None)
             if listener is None:
-                print("Response was received for non-request message")
-                print(response_id)
-                print(self._temporary_request_listeners)
+                # TODO: Change to a logger warning?
+                print(f"Response was received for non-request message. Response id {response_id} because of {message._raw_data}")
             elif isinstance(listener, Future):
                 listener.set_result(message)
                 del self._temporary_request_listeners[response_id]
@@ -243,14 +239,16 @@ class IpcMessage():
         self._connection = connection
 
     async def respond(self, message, *, request_response=False):
-        if (response_id := self._raw_data.get("request_id")) is None:
+        if not self.respondable:
             raise ValueError("Can't respond to a non-respondable message")
         if request_response:
             request_id = uuid4().hex
             response = self._ipc.register_response(request_id)
         else:
             request_id = None
+        response_id = self._raw_data["response_id"]
         await self._ipc.send_raw_message(None, message, self._raw_data["from"], response_id=response_id, request_id=request_id)
+        self._has_responded = True
         if request_response:
             return await response
 
