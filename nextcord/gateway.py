@@ -375,8 +375,8 @@ class DiscordWebSocket:
                 'token': self.token,
                 'properties': {
                     '$os': sys.platform,
-                    '$browser': 'nextcord',
-                    '$device': 'nextcord',
+                    '$browser': 'discord iOS',
+                    '$device': 'discord iOS',
                     '$referrer': '',
                     '$referring_domain': ''
                 },
